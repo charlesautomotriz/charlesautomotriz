@@ -7,6 +7,7 @@ import sqlite3
 import tempfile
 import subprocess
 import base64
+from copy import deepcopy
 from pathlib import Path
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
@@ -35,7 +36,12 @@ APP_DIR = Path(__file__).parent
 DATA_DIR = APP_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
-TEMPLATE_FILE = APP_DIR / "cotizacion_charles_servicio_automotriz.docx"
+TEMPLATE_CANDIDATES = [
+    APP_DIR / "plantilla_cotizacion_charles_usuario.docx",
+    APP_DIR / "cotizacion_charles_servicio_automotriz.docx",
+    APP_DIR / "Cotizacion Charles Servicio Automotriz.docx",
+]
+TEMPLATE_FILE = next((p for p in TEMPLATE_CANDIDATES if p.exists()), TEMPLATE_CANDIDATES[0])
 LOGO_FILE = APP_DIR / "marca charles.png"
 LOGO_FONDO = APP_DIR / "logo charles blanco 21 jun 2025, 23_06_15.png"
 DB_FILE = DATA_DIR / "cotizaciones_charles.db"
@@ -568,14 +574,19 @@ def actualizar_catalogo(catalogo_id: int, valor: float | None = None, activo: st
         local_update_catalogo(catalogo_id, valor=valor, activo=activo)
 
 # =========================================================
-# GENERACIÓN DOCUMENTO USANDO LA PLANTILLA WORD DEL USUARIO
+# GENERACIÓN DOCUMENTO USANDO PLANTILLA WORD
+# Plantilla actual: campos simples <<campo>> y filas dinámicas:
+#   {%tr for item in mano_obra %}
+#   <<item.descripcion>> | <<item.cantidad>> | <<item.valor_unitario>> | <<item.total>>
+#   {%tr endfor %}
+# No usa docxtpl. Usa solo python-docx.
 # =========================================================
 def preparar_items_contexto(items: list[dict], categoria: str) -> list[dict]:
-    filtrados = [i for i in items if i["categoria"] == categoria]
+    filtrados = [i for i in items if i.get("categoria") == categoria]
     salida = []
     for i in filtrados:
         salida.append({
-            "descripcion": i.get("descripcion", ""),
+            "descripcion": str(i.get("descripcion", "") or ""),
             "cantidad": f"{to_float(i.get('cantidad')):,.0f}".replace(",", "."),
             "valor_unitario": clp_fmt(i.get("valor_unitario", 0)),
             "total": clp_fmt(i.get("total", 0)),
@@ -609,88 +620,108 @@ def construir_contexto(cot: dict, items: list[dict]) -> dict:
     }
 
 
-def _texto_item(items: list[dict], idx: int, campo: str = "descripcion") -> str:
-    """Retorna el campo del ítem idx o vacío. idx es 0, 1, 2."""
+def _normalizar_placeholder(txt: str) -> str:
+    """Normaliza espacios invisibles típicos de Word dentro de placeholders."""
+    return (txt or "").replace("\u00a0", " ").replace("\u200b", "")
+
+
+def _valor_item(items: list[dict], idx: int, campo: str) -> str:
     try:
-        return str(items[idx].get(campo, ""))
+        return str(items[idx].get(campo, "") or "")
     except Exception:
         return ""
 
 
-def _agregar_extras_observaciones(obs: str, contexto: dict) -> str:
-    """La plantilla del usuario trae 3 filas visibles por categoría.
-    Si hay más de 3 ítems, los agregamos al bloque Observaciones para no perder información.
-    """
-    extras = []
-    for titulo, key in [("Mano de obra adicional", "mano_obra"), ("Repuestos adicionales", "repuestos"), ("Otros adicionales", "otros")]:
-        lista = contexto.get(key, [])
-        if len(lista) > 3:
-            extras.append(titulo + ":")
-            for it in lista[3:]:
-                extras.append(f"- {it.get('descripcion', '')} | Cant.: {it.get('cantidad', '')} | Total: {it.get('total', '')}")
-    if extras:
-        obs = (obs or "").strip()
-        if obs:
-            obs += "\n\n"
-        obs += "Ítems adicionales no visibles en las 3 filas principales:\n" + "\n".join(extras)
-    return obs or "Sin observaciones."
+def _agregar_reemplazo(mapa: dict, clave: str, valor):
+    """Agrega múltiples variantes para evitar fallas por mayúsculas/espacios."""
+    valor = str(valor or "")
+    base = str(clave)
+    variantes = {
+        f"<<{base}>>",
+        f"<< {base} >>",
+        f"<<{base} >>",
+        f"<< {base}>>",
+        f"<<{base.lower()}>>",
+        f"<< {base.lower()} >>",
+        f"<<{base.upper()}>>",
+        f"<< {base.upper()} >>",
+        f"{{{{ {base} }}}}",
+        f"{{{{{base}}}}}",
+        f"{{{{ {base.lower()} }}}}",
+        f"{{{{{base.lower()}}}}}",
+    }
+    # Variante con primera letra mayúscula, útil para campos antiguos: <<Fecha>>, <<Marca>>
+    variantes.add(f"<<{base[:1].upper() + base[1:]}>>")
+    variantes.add(f"<< {base[:1].upper() + base[1:]} >>")
+    for v in variantes:
+        mapa[v] = valor
 
 
 def _mapa_reemplazos(contexto: dict) -> dict:
-    mo = contexto.get("mano_obra", [])
-    rep = contexto.get("repuestos", [])
-    otros = contexto.get("otros", [])
-    obs = _agregar_extras_observaciones(contexto.get("observaciones", ""), contexto)
+    mapa = {}
+    campos = [
+        "numero_cotizacion", "fecha", "estado", "cliente", "contacto_cel", "mail_cliente",
+        "patente", "marca", "modelo", "anio", "kilometraje", "vin",
+        "total_mano_obra", "total_repuestos", "total_otros", "total", "observaciones", "condiciones",
+    ]
+    for campo in campos:
+        _agregar_reemplazo(mapa, campo, contexto.get(campo, ""))
 
-    mapa = {
-        "<<Numero de cotización>>": contexto.get("numero_cotizacion", ""),
-        "<<Fecha>>": contexto.get("fecha", ""),
-        "<<Patente>>": contexto.get("patente", ""),
-        "<< Cliente >>": contexto.get("cliente", ""),
-        "<<Cliente>>": contexto.get("cliente", ""),
-        "<<Año>>": contexto.get("anio", ""),
-        "<<Contacto Cel>>": contexto.get("contacto_cel", ""),
-        "<<Kilometraje>>": contexto.get("kilometraje", ""),
-        "<<Mail del cliente>>": contexto.get("mail_cliente", ""),
-        "<<VIN>>": contexto.get("vin", ""),
-        "<<Marca>>": contexto.get("marca", ""),
-        "<<Modelo>>": contexto.get("modelo", ""),
-        "<<Total solo mano de obra>>": contexto.get("total_mano_obra", "$ 0"),
-        "<<Total Rptos>>": contexto.get("total_repuestos", "$ 0"),
-        "<<Total>>": contexto.get("total", "$ 0"),
-        "<<Observaciones>>": obs,
+    # Compatibilidad con nombres antiguos de la primera plantilla
+    alias = {
+        "Numero de cotización": "numero_cotizacion",
+        "Numero de cotizacion": "numero_cotizacion",
+        "Fecha": "fecha",
+        "Estado": "estado",
+        "Cliente": "cliente",
+        " Cliente ": "cliente",
+        "Contacto Cel": "contacto_cel",
+        "Mail del cliente": "mail_cliente",
+        "Patente": "patente",
+        "Marca": "marca",
+        "Modelo": "modelo",
+        "Año": "anio",
+        "Anio": "anio",
+        "Kilometraje": "kilometraje",
+        "VIN": "vin",
+        "Total solo mano de obra": "total_mano_obra",
+        "Total Rptos": "total_repuestos",
+        "Total Otros": "total_otros",
+        "Total": "total",
+        "Observaciones": "observaciones",
+        "Condiciones": "condiciones",
     }
+    for alias_txt, campo in alias.items():
+        _agregar_reemplazo(mapa, alias_txt, contexto.get(campo, ""))
 
+    # Compatibilidad con plantillas fijas de 3 filas
     for i in range(3):
         n = i + 1
-        mapa[f"<<Trabajos a realizar {n}>>"] = _texto_item(mo, i, "descripcion")
-        mapa[f"<<Valor total servicio {n}>>"] = _texto_item(mo, i, "total")
-
-        mapa[f"<<Repuestos comprometidos {n}>>"] = _texto_item(rep, i, "descripcion")
-        mapa[f"<< Repuestos comprometidos {n}>>"] = _texto_item(rep, i, "descripcion")
-        mapa[f"<<Valor total repuestos comprometidos {n}>>"] = _texto_item(rep, i, "total")
-
-        mapa[f"<<Otros {n} >>"] = _texto_item(otros, i, "descripcion")
-        mapa[f"<<Otros {n}>>"] = _texto_item(otros, i, "descripcion")
-        mapa[f"<<Valor total Otros {n}>>"] = _texto_item(otros, i, "total")
+        for etiqueta, lista_key, campo in [
+            (f"Trabajos a realizar {n}", "mano_obra", "descripcion"),
+            (f"Valor total servicio {n}", "mano_obra", "total"),
+            (f"Repuestos comprometidos {n}", "repuestos", "descripcion"),
+            (f"Valor total repuestos comprometidos {n}", "repuestos", "total"),
+            (f"Otros {n}", "otros", "descripcion"),
+            (f"Valor total Otros {n}", "otros", "total"),
+        ]:
+            _agregar_reemplazo(mapa, etiqueta, _valor_item(contexto.get(lista_key, []), i, campo))
     return mapa
 
 
+def _replace_in_text(texto: str, mapa: dict) -> str:
+    nuevo = _normalizar_placeholder(texto)
+    for clave in sorted(mapa.keys(), key=len, reverse=True):
+        nuevo = nuevo.replace(clave, str(mapa[clave] or ""))
+    return nuevo
+
+
 def _reemplazar_texto_en_parrafo(paragraph, mapa: dict):
-    """Reemplaza placeholders aunque estén partidos en varios runs.
-    Mantiene el estilo general del párrafo/celda, pero consolida el texto reemplazado en el primer run.
-    """
+    """Reemplaza campos aunque Word haya partido el texto en varios runs."""
     texto = paragraph.text
-    if "<<" not in texto and "COTIZACIÓN N° 00" not in texto:
+    if not any(x in texto for x in ["<<", "{{", "{%"]):
         return
-    nuevo = texto
-    for clave, valor in mapa.items():
-        nuevo = nuevo.replace(clave, str(valor or ""))
-    # La plantilla trae 'COTIZACIÓN N° 00<<Numero...>>'. Evitamos que quede 00CSA-0001.
-    numero = str(mapa.get("<<Numero de cotización>>", ""))
-    if numero:
-        nuevo = nuevo.replace("COTIZACIÓN N° 00" + numero, "COTIZACIÓN N° " + numero)
-        nuevo = nuevo.replace("COTIZACIÓN N°00" + numero, "COTIZACIÓN N° " + numero)
+    nuevo = _replace_in_text(texto, mapa)
     if nuevo != texto:
         if not paragraph.runs:
             paragraph.add_run(nuevo)
@@ -698,6 +729,84 @@ def _reemplazar_texto_en_parrafo(paragraph, mapa: dict):
             paragraph.runs[0].text = nuevo
             for run in paragraph.runs[1:]:
                 run.text = ""
+
+
+def _replace_text_in_xml_container(container, mapa: dict):
+    """Reemplaza texto en XML manteniendo las columnas de la fila.
+
+    Word puede partir un placeholder en varios runs dentro de una celda.
+    Por eso se unen los w:t de CADA CELDA, no de toda la fila, se reemplaza
+    y se deja el resultado en el primer w:t de esa misma celda.
+    """
+    cells = [node for node in container.iter() if node.tag.endswith('}tc')]
+    if not cells:
+        cells = [container]
+    for cell in cells:
+        text_nodes = [node for node in cell.iter() if node.tag.endswith('}t')]
+        if not text_nodes:
+            continue
+        original = "".join(node.text or "" for node in text_nodes)
+        if not any(x in original for x in ["<<", "{{", "{%"]):
+            continue
+        nuevo = _replace_in_text(original, mapa)
+        text_nodes[0].text = nuevo
+        for node in text_nodes[1:]:
+            node.text = ""
+
+
+def _reemplazos_item(item: dict) -> dict:
+    mapa = {}
+    for campo in ["descripcion", "cantidad", "valor_unitario", "total"]:
+        valor = item.get(campo, "")
+        # Formato actual del template del usuario
+        _agregar_reemplazo(mapa, f"item.{campo}", valor)
+        # Formato docxtpl/jinja alternativo
+        mapa[f"{{{{ item.{campo} }}}}"] = str(valor or "")
+        mapa[f"{{{{item.{campo}}}}}"] = str(valor or "")
+    return mapa
+
+
+def _expandir_tablas_dinamicas(doc: Document, contexto: dict):
+    """Expande tablas con marcador {%tr for item in mano_obra/repuestos/otros %}.
+    La fila siguiente se usa como plantilla y puede contener <<item.descripcion>>.
+    """
+    patron_for = re.compile(r"\{\%tr\s+for\s+item\s+in\s+(mano_obra|repuestos|otros)\s+\%\}")
+    for table in list(doc.tables):
+        while True:
+            rows = list(table.rows)
+            found = False
+            for idx, row in enumerate(rows):
+                row_text = " | ".join(cell.text for cell in row.cells)
+                m = patron_for.search(row_text)
+                if not m:
+                    continue
+                found = True
+                key = m.group(1)
+                items = contexto.get(key, []) or [{"descripcion": "", "cantidad": "", "valor_unitario": "", "total": ""}]
+
+                marker_row = row
+                template_row = rows[idx + 1] if idx + 1 < len(rows) else None
+                end_row = rows[idx + 2] if idx + 2 < len(rows) else None
+                if template_row is None:
+                    continue
+
+                insert_after = template_row._tr
+                for item in items:
+                    new_tr = deepcopy(template_row._tr)
+                    _replace_text_in_xml_container(new_tr, _reemplazos_item(item))
+                    insert_after.addnext(new_tr)
+                    insert_after = new_tr
+
+                parent = table._tbl
+                for r in [marker_row, template_row, end_row]:
+                    if r is not None:
+                        try:
+                            parent.remove(r._tr)
+                        except Exception:
+                            pass
+                break
+            if not found:
+                break
 
 
 def _recorrer_tablas(tablas, mapa: dict):
@@ -710,15 +819,14 @@ def _recorrer_tablas(tablas, mapa: dict):
 
 
 def generar_docx_bytes(contexto: dict) -> bytes:
-    """Genera el Word usando la plantilla cargada por el usuario.
-    No usa docxtpl. Usa python-docx para reemplazar los campos <<...>>.
-    """
     if not TEMPLATE_FILE.exists():
         raise FileNotFoundError(
             f"No se encontró la plantilla Word '{TEMPLATE_FILE.name}'. Debe estar en la misma carpeta que streamlit_app.py."
         )
     doc = Document(str(TEMPLATE_FILE))
     mapa = _mapa_reemplazos(contexto)
+
+    _expandir_tablas_dinamicas(doc, contexto)
 
     for p in doc.paragraphs:
         _reemplazar_texto_en_parrafo(p, mapa)
@@ -752,6 +860,7 @@ def convertir_pdf_bytes(docx_bytes: bytes) -> bytes | None:
         if res.returncode != 0 or not pdf_path.exists():
             return None
         return pdf_path.read_bytes()
+
 
 # =========================================================
 # COMPONENTES UI
