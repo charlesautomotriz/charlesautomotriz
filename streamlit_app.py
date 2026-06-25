@@ -7,14 +7,13 @@ import sqlite3
 import tempfile
 import subprocess
 import base64
-import zipfile
-from xml.sax.saxutils import escape
 from pathlib import Path
 from datetime import datetime, date
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
+from docx import Document
 
 # =========================================================
 # CONFIGURACIÓN GENERAL
@@ -36,7 +35,7 @@ APP_DIR = Path(__file__).parent
 DATA_DIR = APP_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
-TEMPLATE_FILE = APP_DIR / "plantilla_cotizacion_charles_profesional.docx"
+TEMPLATE_FILE = APP_DIR / "plantilla_cotizacion_charles_usuario.docx"
 LOGO_FILE = APP_DIR / "marca charles.png"
 LOGO_FONDO = APP_DIR / "logo charles blanco 21 jun 2025, 23_06_15.png"
 DB_FILE = DATA_DIR / "cotizaciones_charles.db"
@@ -569,7 +568,7 @@ def actualizar_catalogo(catalogo_id: int, valor: float | None = None, activo: st
         local_update_catalogo(catalogo_id, valor=valor, activo=activo)
 
 # =========================================================
-# GENERACIÓN DOCUMENTO
+# GENERACIÓN DOCUMENTO USANDO LA PLANTILLA WORD DEL USUARIO
 # =========================================================
 def preparar_items_contexto(items: list[dict], categoria: str) -> list[dict]:
     filtrados = [i for i in items if i["categoria"] == categoria]
@@ -610,160 +609,133 @@ def construir_contexto(cot: dict, items: list[dict]) -> dict:
     }
 
 
-def xml_text(valor) -> str:
-    """Texto seguro para XML Word."""
-    return escape(str(valor or ""))
+def _texto_item(items: list[dict], idx: int, campo: str = "descripcion") -> str:
+    """Retorna el campo del ítem idx o vacío. idx es 0, 1, 2."""
+    try:
+        return str(items[idx].get(campo, ""))
+    except Exception:
+        return ""
 
 
-def w_p(texto="", bold=False, size=20, color="111111", align="left", spacing_after=120):
-    jc = {"left": "left", "center": "center", "right": "right"}.get(align, "left")
-    b = "<w:b/>" if bold else ""
-    return f"""
-    <w:p>
-      <w:pPr><w:jc w:val=\"{jc}\"/><w:spacing w:after=\"{spacing_after}\"/></w:pPr>
-      <w:r><w:rPr>{b}<w:sz w:val=\"{size}\"/><w:color w:val=\"{color}\"/></w:rPr><w:t>{xml_text(texto)}</w:t></w:r>
-    </w:p>"""
+def _agregar_extras_observaciones(obs: str, contexto: dict) -> str:
+    """La plantilla del usuario trae 3 filas visibles por categoría.
+    Si hay más de 3 ítems, los agregamos al bloque Observaciones para no perder información.
+    """
+    extras = []
+    for titulo, key in [("Mano de obra adicional", "mano_obra"), ("Repuestos adicionales", "repuestos"), ("Otros adicionales", "otros")]:
+        lista = contexto.get(key, [])
+        if len(lista) > 3:
+            extras.append(titulo + ":")
+            for it in lista[3:]:
+                extras.append(f"- {it.get('descripcion', '')} | Cant.: {it.get('cantidad', '')} | Total: {it.get('total', '')}")
+    if extras:
+        obs = (obs or "").strip()
+        if obs:
+            obs += "\n\n"
+        obs += "Ítems adicionales no visibles en las 3 filas principales:\n" + "\n".join(extras)
+    return obs or "Sin observaciones."
 
 
-def w_cell(texto="", bold=False, bg=None, align="left", width="2400", color="111111"):
-    fill = f'<w:shd w:fill=\"{bg}\"/>' if bg else ""
-    b = "<w:b/>" if bold else ""
-    jc = {"left": "left", "center": "center", "right": "right"}.get(align, "left")
-    return f"""
-    <w:tc>
-      <w:tcPr><w:tcW w:w=\"{width}\" w:type=\"dxa\"/>{fill}<w:tcMar><w:top w:w=\"80\" w:type=\"dxa\"/><w:left w:w=\"90\" w:type=\"dxa\"/><w:bottom w:w=\"80\" w:type=\"dxa\"/><w:right w:w=\"90\" w:type=\"dxa\"/></w:tcMar></w:tcPr>
-      <w:p><w:pPr><w:jc w:val=\"{jc}\"/></w:pPr><w:r><w:rPr>{b}<w:sz w:val=\"18\"/><w:color w:val=\"{color}\"/></w:rPr><w:t>{xml_text(texto)}</w:t></w:r></w:p>
-    </w:tc>"""
+def _mapa_reemplazos(contexto: dict) -> dict:
+    mo = contexto.get("mano_obra", [])
+    rep = contexto.get("repuestos", [])
+    otros = contexto.get("otros", [])
+    obs = _agregar_extras_observaciones(contexto.get("observaciones", ""), contexto)
+
+    mapa = {
+        "<<Numero de cotización>>": contexto.get("numero_cotizacion", ""),
+        "<<Fecha>>": contexto.get("fecha", ""),
+        "<<Patente>>": contexto.get("patente", ""),
+        "<< Cliente >>": contexto.get("cliente", ""),
+        "<<Cliente>>": contexto.get("cliente", ""),
+        "<<Año>>": contexto.get("anio", ""),
+        "<<Contacto Cel>>": contexto.get("contacto_cel", ""),
+        "<<Kilometraje>>": contexto.get("kilometraje", ""),
+        "<<Mail del cliente>>": contexto.get("mail_cliente", ""),
+        "<<VIN>>": contexto.get("vin", ""),
+        "<<Marca>>": contexto.get("marca", ""),
+        "<<Modelo>>": contexto.get("modelo", ""),
+        "<<Total solo mano de obra>>": contexto.get("total_mano_obra", "$ 0"),
+        "<<Total Rptos>>": contexto.get("total_repuestos", "$ 0"),
+        "<<Total>>": contexto.get("total", "$ 0"),
+        "<<Observaciones>>": obs,
+    }
+
+    for i in range(3):
+        n = i + 1
+        mapa[f"<<Trabajos a realizar {n}>>"] = _texto_item(mo, i, "descripcion")
+        mapa[f"<<Valor total servicio {n}>>"] = _texto_item(mo, i, "total")
+
+        mapa[f"<<Repuestos comprometidos {n}>>"] = _texto_item(rep, i, "descripcion")
+        mapa[f"<< Repuestos comprometidos {n}>>"] = _texto_item(rep, i, "descripcion")
+        mapa[f"<<Valor total repuestos comprometidos {n}>>"] = _texto_item(rep, i, "total")
+
+        mapa[f"<<Otros {n} >>"] = _texto_item(otros, i, "descripcion")
+        mapa[f"<<Otros {n}>>"] = _texto_item(otros, i, "descripcion")
+        mapa[f"<<Valor total Otros {n}>>"] = _texto_item(otros, i, "total")
+    return mapa
 
 
-def w_row(cells):
-    return "<w:tr>" + "".join(cells) + "</w:tr>"
+def _reemplazar_texto_en_parrafo(paragraph, mapa: dict):
+    """Reemplaza placeholders aunque estén partidos en varios runs.
+    Mantiene el estilo general del párrafo/celda, pero consolida el texto reemplazado en el primer run.
+    """
+    texto = paragraph.text
+    if "<<" not in texto and "COTIZACIÓN N° 00" not in texto:
+        return
+    nuevo = texto
+    for clave, valor in mapa.items():
+        nuevo = nuevo.replace(clave, str(valor or ""))
+    # La plantilla trae 'COTIZACIÓN N° 00<<Numero...>>'. Evitamos que quede 00CSA-0001.
+    numero = str(mapa.get("<<Numero de cotización>>", ""))
+    if numero:
+        nuevo = nuevo.replace("COTIZACIÓN N° 00" + numero, "COTIZACIÓN N° " + numero)
+        nuevo = nuevo.replace("COTIZACIÓN N°00" + numero, "COTIZACIÓN N° " + numero)
+    if nuevo != texto:
+        if not paragraph.runs:
+            paragraph.add_run(nuevo)
+        else:
+            paragraph.runs[0].text = nuevo
+            for run in paragraph.runs[1:]:
+                run.text = ""
 
 
-def w_table(rows, widths=None):
-    grid = ""
-    if widths:
-        grid = "<w:tblGrid>" + "".join(f'<w:gridCol w:w=\"{w}\"/>' for w in widths) + "</w:tblGrid>"
-    return f"""
-    <w:tbl>
-      <w:tblPr>
-        <w:tblStyle w:val=\"TableGrid\"/>
-        <w:tblW w:w=\"0\" w:type=\"auto\"/>
-        <w:tblBorders>
-          <w:top w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"D0D0D0\"/>
-          <w:left w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"D0D0D0\"/>
-          <w:bottom w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"D0D0D0\"/>
-          <w:right w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"D0D0D0\"/>
-          <w:insideH w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"D0D0D0\"/>
-          <w:insideV w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"D0D0D0\"/>
-        </w:tblBorders>
-      </w:tblPr>
-      {grid}
-      {''.join(rows)}
-    </w:tbl>"""
-
-
-def tabla_datos(contexto: dict) -> str:
-    rows = []
-    data = [
-        ("Fecha", contexto.get("fecha", ""), "Estado", contexto.get("estado", "")),
-        ("Cliente", contexto.get("cliente", ""), "Patente", contexto.get("patente", "")),
-        ("Contacto", contexto.get("contacto_cel", ""), "Marca", contexto.get("marca", "")),
-        ("Mail", contexto.get("mail_cliente", ""), "Modelo", contexto.get("modelo", "")),
-        ("Año", contexto.get("anio", ""), "Kilometraje", contexto.get("kilometraje", "")),
-        ("VIN", contexto.get("vin", ""), "", ""),
-    ]
-    for a, b, c, d in data:
-        rows.append(w_row([
-            w_cell(a, bold=True, bg="F3F4F6", width="1500"), w_cell(b, width="3300"),
-            w_cell(c, bold=True, bg="F3F4F6", width="1500"), w_cell(d, width="3300"),
-        ]))
-    return w_table(rows, [1500, 3300, 1500, 3300])
-
-
-def tabla_items(titulo: str, items: list[dict]) -> str:
-    rows = [w_row([
-        w_cell("Descripción", bold=True, bg="111111", color="FFFFFF", width="5200"),
-        w_cell("Cant.", bold=True, bg="111111", color="FFFFFF", align="center", width="1000"),
-        w_cell("V. unitario", bold=True, bg="111111", color="FFFFFF", align="right", width="1700"),
-        w_cell("Total", bold=True, bg="111111", color="FFFFFF", align="right", width="1700"),
-    ])]
-    if not items:
-        rows.append(w_row([w_cell("Sin ítems", width="5200"), w_cell("", width="1000"), w_cell("", width="1700"), w_cell("", width="1700")]))
-    else:
-        for it in items:
-            rows.append(w_row([
-                w_cell(it.get("descripcion", ""), width="5200"),
-                w_cell(it.get("cantidad", ""), align="center", width="1000"),
-                w_cell(it.get("valor_unitario", ""), align="right", width="1700"),
-                w_cell(it.get("total", ""), align="right", width="1700"),
-            ]))
-    return w_p(titulo, bold=True, size=22, color="D96816", spacing_after=80) + w_table(rows, [5200, 1000, 1700, 1700])
+def _recorrer_tablas(tablas, mapa: dict):
+    for table in tablas:
+        for row in table.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    _reemplazar_texto_en_parrafo(p, mapa)
+                _recorrer_tablas(cell.tables, mapa)
 
 
 def generar_docx_bytes(contexto: dict) -> bytes:
-    """Genera un Word profesional sin docxtpl ni python-docx.
-    Así evita el error de dependencia en Streamlit Cloud/Codespaces.
+    """Genera el Word usando la plantilla cargada por el usuario.
+    No usa docxtpl. Usa python-docx para reemplazar los campos <<...>>.
     """
-    resumen_rows = [
-        w_row([w_cell("Total mano de obra", bold=True, width="3500"), w_cell(contexto.get("total_mano_obra", "$ 0"), align="right", width="2500")]),
-        w_row([w_cell("Total repuestos", bold=True, width="3500"), w_cell(contexto.get("total_repuestos", "$ 0"), align="right", width="2500")]),
-        w_row([w_cell("Total otros", bold=True, width="3500"), w_cell(contexto.get("total_otros", "$ 0"), align="right", width="2500")]),
-        w_row([w_cell("TOTAL COTIZACIÓN", bold=True, bg="D96816", color="FFFFFF", width="3500"), w_cell(contexto.get("total", "$ 0"), bold=True, bg="D96816", color="FFFFFF", align="right", width="2500")]),
-    ]
+    if not TEMPLATE_FILE.exists():
+        raise FileNotFoundError(
+            f"No se encontró la plantilla Word '{TEMPLATE_FILE.name}'. Debe estar en la misma carpeta que streamlit_app.py."
+        )
+    doc = Document(str(TEMPLATE_FILE))
+    mapa = _mapa_reemplazos(contexto)
 
-    body = f"""
-    {w_p("CHARLES SERVICIO AUTOMOTRIZ", bold=True, size=32, color="111111", align="center", spacing_after=40)}
-    {w_p("San Bernardo, Chile | Matías Vejar Reyes | charlesautomotriz@gmail.com | +56 9 3453 3841", size=18, color="444444", align="center", spacing_after=180)}
-    {w_p("COTIZACIÓN N° " + str(contexto.get("numero_cotizacion", "")), bold=True, size=28, color="D96816", align="center", spacing_after=180)}
-    {tabla_datos(contexto)}
-    {w_p("", spacing_after=80)}
-    {tabla_items("MANO DE OBRA", contexto.get("mano_obra", []))}
-    {w_p("", spacing_after=60)}
-    {tabla_items("REPUESTOS", contexto.get("repuestos", []))}
-    {w_p("", spacing_after=60)}
-    {tabla_items("OTROS", contexto.get("otros", []))}
-    {w_p("", spacing_after=80)}
-    {w_p("OBSERVACIONES", bold=True, size=22, color="D96816", spacing_after=60)}
-    {w_table([w_row([w_cell(contexto.get("observaciones", "Sin observaciones."), width="9600")])], [9600])}
-    {w_p("", spacing_after=80)}
-    {w_p("RESUMEN", bold=True, size=22, color="D96816", spacing_after=60)}
-    {w_table(resumen_rows, [3500, 2500])}
-    {w_p("CONDICIONES", bold=True, size=22, color="D96816", spacing_after=60)}
-    {w_p(contexto.get("condiciones", ""), size=18, color="111111", spacing_after=80)}
-    {w_p("¡Gracias por confiar en Charles Servicio Automotriz!", bold=True, size=18, color="444444", align="center", spacing_after=40)}
-    {w_p("Servicio profesional, atención cercana y compromiso con tu vehículo.", size=18, color="444444", align="center", spacing_after=40)}
-    """
+    for p in doc.paragraphs:
+        _reemplazar_texto_en_parrafo(p, mapa)
+    _recorrer_tablas(doc.tables, mapa)
 
-    document_xml = f"""<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>
-    <w:document xmlns:wpc=\"http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas\" xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\" xmlns:o=\"urn:schemas-microsoft-com:office:office\" xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" xmlns:m=\"http://schemas.openxmlformats.org/officeDocument/2006/math\" xmlns:v=\"urn:schemas-microsoft-com:vml\" xmlns:wp14=\"http://schemas.microsoft.com/office/word/2010/wordprocessingDrawing\" xmlns:wp=\"http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing\" xmlns:w10=\"urn:schemas-microsoft-com:office:word\" xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" xmlns:w14=\"http://schemas.microsoft.com/office/word/2010/wordml\" xmlns:wpg=\"http://schemas.microsoft.com/office/word/2010/wordprocessingGroup\" xmlns:wpi=\"http://schemas.microsoft.com/office/word/2010/wordprocessingInk\" xmlns:wne=\"http://schemas.microsoft.com/office/word/2006/wordml\" xmlns:wps=\"http://schemas.microsoft.com/office/word/2010/wordprocessingShape\" mc:Ignorable=\"w14 wp14\">
-      <w:body>
-        {body}
-        <w:sectPr>
-          <w:pgSz w:w=\"12240\" w:h=\"15840\"/>
-          <w:pgMar w:top=\"720\" w:right=\"720\" w:bottom=\"720\" w:left=\"720\" w:header=\"360\" w:footer=\"360\" w:gutter=\"0\"/>
-        </w:sectPr>
-      </w:body>
-    </w:document>"""
-
-    styles_xml = """<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>
-    <w:styles xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">
-      <w:style w:type=\"paragraph\" w:default=\"1\" w:styleId=\"Normal\"><w:name w:val=\"Normal\"/><w:rPr><w:rFonts w:ascii=\"Arial\" w:hAnsi=\"Arial\"/><w:sz w:val=\"20\"/></w:rPr></w:style>
-      <w:style w:type=\"table\" w:styleId=\"TableGrid\"><w:name w:val=\"Table Grid\"/><w:tblPr><w:tblBorders><w:top w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"D0D0D0\"/><w:left w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"D0D0D0\"/><w:bottom w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"D0D0D0\"/><w:right w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"D0D0D0\"/><w:insideH w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"D0D0D0\"/><w:insideV w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"D0D0D0\"/></w:tblBorders></w:tblPr></w:style>
-    </w:styles>"""
-    content_types = """<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>
-    <Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/><Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/><Override PartName=\"/word/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml\"/></Types>"""
-    rels = """<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"word/document.xml\"/></Relationships>"""
-    doc_rels = """<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?><Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rIdStyles\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/></Relationships>"""
+    for section in doc.sections:
+        for p in section.header.paragraphs:
+            _reemplazar_texto_en_parrafo(p, mapa)
+        _recorrer_tablas(section.header.tables, mapa)
+        for p in section.footer.paragraphs:
+            _reemplazar_texto_en_parrafo(p, mapa)
+        _recorrer_tablas(section.footer.tables, mapa)
 
     bio = io.BytesIO()
-    with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr("[Content_Types].xml", content_types)
-        z.writestr("_rels/.rels", rels)
-        z.writestr("word/_rels/document.xml.rels", doc_rels)
-        z.writestr("word/document.xml", document_xml)
-        z.writestr("word/styles.xml", styles_xml)
+    doc.save(bio)
     return bio.getvalue()
+
 
 def convertir_pdf_bytes(docx_bytes: bytes) -> bytes | None:
     posibles = [shutil.which("soffice"), "/usr/bin/soffice", "/usr/local/bin/soffice"]
