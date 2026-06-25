@@ -35,7 +35,7 @@ APP_DIR = Path(__file__).parent
 DATA_DIR = APP_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
-TEMPLATE_FILE = APP_DIR / "plantilla_cotizacion_charles_usuario.docx"
+TEMPLATE_FILE = APP_DIR / "cotizacion_charles_servicio_automotriz.docx"
 LOGO_FILE = APP_DIR / "marca charles.png"
 LOGO_FONDO = APP_DIR / "logo charles blanco 21 jun 2025, 23_06_15.png"
 DB_FILE = DATA_DIR / "cotizaciones_charles.db"
