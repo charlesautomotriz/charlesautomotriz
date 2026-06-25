@@ -1,7 +1,8 @@
 streamlit
 pandas
-plotly
-python-docx
 openpyxl
+python-docx
+docxtpl
+plotly
 gspread
 google-auth
