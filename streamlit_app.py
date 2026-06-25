@@ -13,14 +13,6 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
-from docxtpl import DocxTemplate
-
-try:
-    import gspread
-    from google.oauth2.service_account import Credentials
-except Exception:
-    gspread = None
-    Credentials = None
 
 # =========================================================
 # CONFIGURACIÓN GENERAL
@@ -30,6 +22,24 @@ st.set_page_config(
     page_icon="🔧",
     layout="wide",
 )
+
+# Dependencia necesaria para completar la plantilla Word.
+# Si no está instalada, la app mostrará una instrucción clara en pantalla
+# en vez de caerse con ModuleNotFoundError.
+try:
+    from docxtpl import DocxTemplate
+except ModuleNotFoundError:
+    st.error("Falta instalar la librería docxtpl, necesaria para generar la cotización Word.")
+    st.code("python -m pip install docxtpl python-docx", language="bash")
+    st.info("Luego vuelve a ejecutar: python -m streamlit run streamlit_app.py --server.port 8501 --server.address 0.0.0.0")
+    st.stop()
+
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+except Exception:
+    gspread = None
+    Credentials = None
 
 APP_DIR = Path(__file__).parent
 DATA_DIR = APP_DIR / "data"
@@ -493,15 +503,18 @@ def siguiente_id(df: pd.DataFrame, col: str) -> int:
 
 
 def siguiente_correlativo() -> int:
+    """Devuelve el siguiente correlativo sin reutilizar números anteriores.
+
+    Para mantener trazabilidad comercial, el correlativo avanza siempre
+    desde el máximo histórico guardado en la base. Aunque una cotización
+    se anule o se elimine, no se recomienda reutilizar el número.
+    """
     df = cargar_cotizaciones()
     if df.empty:
         return 1
     corr = pd.to_numeric(df["correlativo"], errors="coerce").fillna(0)
-    n = 1
-    usados = set(corr.astype(int).tolist())
-    while n in usados:
-        n += 1
-    return n
+    max_corr = int(corr.max()) if len(corr) else 0
+    return max_corr + 1
 
 
 def guardar_cotizacion(cot: dict, detalle_items: list[dict]):
