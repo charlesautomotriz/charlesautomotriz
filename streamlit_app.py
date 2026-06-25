@@ -52,9 +52,7 @@ ESTADOS = ["Pendiente", "Aceptada", "Rechazada", "En revisión", "Vencida", "Anu
 CATEGORIAS = ["Mano de obra", "Repuestos", "Otros"]
 
 CONDICIONES_DEFAULT = """- Validez de la cotización: 10 días hábiles.
-- Forma de pago: transferencia / efectivo.
-- Valores expresados en pesos chilenos.
-- Cotización sujeta a disponibilidad de repuestos."""
+- Forma de pago: transferencia / efectivo."""
 
 CATALOGO_DEFAULT = [
     # Mano de obra
